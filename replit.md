@@ -1,19 +1,22 @@
-# [Project name]
+# EnigmaTech Inspection Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Telegram bot that turns construction-site photos, recordings, and notes into a Hebrew RTL Word inspection report.
 
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `PYTHONPATH=src python -m enigmatech_inspection_bot.bot` — run the Telegram bot
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required secrets: `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`
+- Optional environment: `BOT_TIMEZONE` (defaults to `Asia/Jerusalem`), `LOG_LEVEL` (defaults to `INFO`)
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
+- Python 3.12, python-telegram-bot, Google GenAI SDK, python-docx
 - API: Express 5
 - DB: PostgreSQL + Drizzle ORM
 - Validation: Zod (`zod/v4`), `drizzle-zod`
@@ -22,23 +25,30 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `src/enigmatech_inspection_bot/` — Telegram handlers, chat sessions, Gemini processing, and Word report generation
+- `tests/` — Python unit tests for model fallback and RTL report formatting
+- `pyproject.toml` and `uv.lock` — Python dependencies and lockfile
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Keep each chat's media session in memory, as requested; a bot restart clears unfinished sessions.
+- Upload media to Gemini's Files API for multimodal processing, then delete uploaded copies after report generation.
+- Prefer `gemini-3.8-flash`; discover an available Flash model only if needed, excluding deprecated Gemini 2.5 Flash models.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- `/start` and `/help` explain how to submit photos, audio, and notes in Hebrew.
+- `/report` produces a Hebrew inspection report with a photo appendix in a properly formatted RTL `.docx`.
+- `/clear` deletes the chat's saved media and notes.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Use Hebrew for bot replies and the generated inspection report.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Keep the Gemini model fallback away from deprecated Gemini 2.5 Flash variants.
+- Local files are temporary and should be removed after successful delivery or `/clear`.
 
 ## Pointers
 
