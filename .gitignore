@@ -57,3 +57,7 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+.bot-runtime/
+.bot-requirements.txt
+.bot-state/
+/generated-artifacts/
