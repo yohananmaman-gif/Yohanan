@@ -38,6 +38,12 @@ class FakeFiles:
             self.deleted.append(name)
 
 
+class GeminiServiceError(Exception):
+    def __init__(self, code):
+        super().__init__("Gemini service error")
+        self.code = code
+
+
 class PipelineTests(unittest.TestCase):
     def run_report(self, *, failure=None, text="דוח"):
         files = FakeFiles(failure)
@@ -81,3 +87,39 @@ class PipelineTests(unittest.TestCase):
     def test_empty_generation_still_cleans_all_media(self):
         with self.assertRaisesRegex(RuntimeError, "empty"):
             self.run_report(text="")
+
+    def test_retries_overloaded_model_then_uses_another_flash_model(self):
+        files = FakeFiles()
+        attempts = []
+
+        def generate(model, **kwargs):
+            attempts.append(model)
+            if model == "gemini-3.8-flash":
+                raise GeminiServiceError(503)
+            return SimpleNamespace(text="דוח חלופי")
+
+        client = SimpleNamespace(
+            files=files,
+            models=SimpleNamespace(
+                generate_content=generate,
+                list=lambda: [
+                    SimpleNamespace(
+                        name="models/gemini-3.7-flash",
+                        supported_actions=["generateContent"],
+                    ),
+                    SimpleNamespace(
+                        name="models/gemini-2.5-flash",
+                        supported_actions=["generateContent"],
+                    ),
+                ],
+            ),
+            close=lambda: None,
+        )
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-fixture"}), \
+             patch("enigmatech_inspection_bot.reporting.genai.Client",
+                   return_value=client), \
+             patch("enigmatech_inspection_bot.reporting.time.sleep"):
+            result = generate_inspection_report([], [], [])
+
+        self.assertEqual(result, "דוח חלופי")
+        self.assertEqual(attempts, ["gemini-3.8-flash"] * 4 + ["gemini-3.7-flash"])

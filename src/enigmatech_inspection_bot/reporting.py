@@ -87,7 +87,7 @@ def _retry(operation: Callable[[], T], attempts: int = 3) -> T:
         except Exception as error:
             if attempt == attempts - 1 or not _is_transient_error(error):
                 raise
-            delay_seconds = 2**attempt
+            delay_seconds = min(2 * (2**attempt), 15)
             logger.warning(
                 "Temporary Gemini API failure; retrying in %s seconds.",
                 delay_seconds,
@@ -104,6 +104,10 @@ def is_model_unavailable(error: Exception) -> bool:
         phrase in message
         for phrase in ("not found", "not supported", "does not exist", "unsupported")
     )
+
+
+def is_model_overloaded(error: Exception) -> bool:
+    return _status_code(error) == 503
 
 
 def choose_latest_flash_model(model_names: list[str]) -> str | None:
@@ -282,14 +286,20 @@ def generate_inspection_report(
                     model=PREFERRED_MODEL,
                     contents=parts,
                     config=config,
-                )
+                ),
+                attempts=4,
             )
         except Exception as error:
-            if not is_model_unavailable(error):
+            if not (is_model_unavailable(error) or is_model_overloaded(error)):
                 raise
+            reason = "overloaded" if is_model_overloaded(error) else "unavailable"
+            logger.warning(
+                "Preferred Gemini model %s; trying another available Flash model.",
+                reason,
+            )
             fallback_model = _latest_flash_model(client)
             logger.warning(
-                "Preferred Gemini model unavailable; using discovered Flash model %s.",
+                "Using discovered Flash model %s.",
                 fallback_model,
             )
             response = _retry(
@@ -297,7 +307,8 @@ def generate_inspection_report(
                     model=fallback_model,
                     contents=parts,
                     config=config,
-                )
+                ),
+                attempts=4,
             )
 
         report_text = (response.text or "").strip()
