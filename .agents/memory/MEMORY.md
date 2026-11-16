@@ -1,2 +1,2 @@
 - [Telegram token logging](telegram-token-logging.md) — suppress HTTP client request logs and sanitize exceptions because Telegram API URLs contain the bot token.
-- [Bot deployment separation](bot-deployment-separation.md) — user chose a separate bot Repl rather than combining it with the API server.
+- [Bot hosting choice](bot-deployment-separation.md) — separate-Repl preference was superseded; reliability and speed take priority, but publishing still needs confirmation.

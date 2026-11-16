@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
+import fcntl
 import logging
 import mimetypes
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -20,6 +23,8 @@ from telegram.error import Conflict
 
 from .reporting import build_report_document, generate_inspection_report
 from .sessions import AudioAsset, InspectionSession, PhotoAsset
+from .state import load_sessions, remove_session, save_session, state_directory
+from .progress import ReportProgress
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -31,6 +36,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 SESSIONS: dict[int, InspectionSession] = {}
 CHAT_LOCKS: dict[int, asyncio.Lock] = {}
+REPORT_SLOTS = asyncio.Semaphore(2)
 
 MAX_PHOTOS_PER_SESSION = 25
 MAX_AUDIO_PER_SESSION = 15
@@ -125,6 +131,7 @@ async def clear_command(
             )
             return
         if session is not None:
+            remove_session(chat_id)
             SESSIONS.pop(chat_id, None)
             session.cleanup()
     await update.message.reply_text(
@@ -170,7 +177,9 @@ async def photo_handler(
             session.photos.append(
                 PhotoAsset(path=path, caption=message.caption, mime_type="image/jpeg")
             )
+            save_session(chat_id, session)
         except Exception as error:
+            session.photos[:] = [photo for photo in session.photos if photo.path != path]
             path.unlink(missing_ok=True)
             logger.error("Could not download a Telegram photo (%s).", type(error).__name__)
             await message.reply_text("❌ לא הצלחתי לשמור את התמונה. נסה לשלוח אותה שוב.")
@@ -234,7 +243,9 @@ async def audio_handler(
                 await message.reply_text("⚠️ קובץ השמע גדול מדי. שלח קובץ עד 20MB.")
                 return
             session.voices.append(AudioAsset(path=path, mime_type=resolved_mime))
+            save_session(chat_id, session)
         except Exception as error:
+            session.voices[:] = [voice for voice in session.voices if voice.path != path]
             path.unlink(missing_ok=True)
             logger.error(
                 "Could not download a Telegram audio file (%s).",
@@ -270,6 +281,13 @@ async def text_handler(
             )
             return
         session.notes.append(note)
+        try:
+            save_session(chat_id, session)
+        except Exception as error:
+            session.notes.pop()
+            logger.error("Could not save note (%s).", type(error).__name__)
+            await message.reply_text("❌ לא הצלחתי לשמור את ההערה. נסה שוב.")
+            return
     await message.reply_text("✅ הערת הטקסט נשמרה.")
 
 
@@ -289,20 +307,41 @@ async def report_command(
         if session.is_reporting:
             await message.reply_text("⏳ הדוח כבר נמצא בתהליך יצירה. אנא המתן.")
             return
-        session.is_reporting = True
+        if REPORT_SLOTS.locked():
+            await message.reply_text(
+                "⏳ המערכת מכינה דוחות אחרים. החומרים שלך נשמרו; נסה /report בעוד רגע."
+            )
+            return
         notes = list(session.notes)
         voices = list(session.voices)
         photos = list(session.photos)
         report_directory = _session_directory(chat_id, session)
+        save_session(chat_id, session)
+        await REPORT_SLOTS.acquire()
+        session.is_reporting = True
 
+    progress = ReportProgress()
+    progress_task = None
+    status_message = None
+    started = time.monotonic()
+    stage = "starting"
     try:
-        await message.reply_text(PROCESSING_MESSAGE)
+        try:
+            status_message = await message.reply_text(PROCESSING_MESSAGE)
+            progress_task = asyncio.create_task(progress.watch(status_message))
+        except Exception as error:
+            logger.warning("Initial progress unavailable (%s).", type(error).__name__)
+        stage = "generation"
         report_text = await asyncio.to_thread(
             generate_inspection_report,
             notes,
             voices,
             photos,
+            progress.set,
         )
+        stage = "document"
+        stage_started = time.monotonic()
+        progress.set("בונה את קובץ ה-Word")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         document_path = report_directory / f"EnigmaTech_Report_{timestamp}.docx"
         await asyncio.to_thread(
@@ -311,24 +350,46 @@ async def report_command(
             photos,
             document_path,
         )
+        logger.info("Report stage=document seconds=%.2f", time.monotonic() - stage_started)
+        stage = "delivery"
+        stage_started = time.monotonic()
+        progress.set("שולח את הדוח ל-Telegram")
         with document_path.open("rb") as document_file:
             await message.reply_document(
                 document=document_file,
                 filename=document_path.name,
                 caption="📄 הדוח מוכן! מצורף קובץ Word מסודר.",
+                write_timeout=120,
+                read_timeout=120,
             )
+        logger.info("Report stage=delivery seconds=%.2f", time.monotonic() - stage_started)
+    except asyncio.CancelledError:
+        session.is_reporting = False
+        raise
     except Exception as error:
-        logger.error("Inspection report generation failed (%s).", type(error).__name__)
+        logger.error("Inspection report failed stage=%s (%s).", stage, type(error).__name__)
         async with _lock_for(chat_id):
             if SESSIONS.get(chat_id) is session:
                 session.is_reporting = False
         await message.reply_text(ERROR_MESSAGE)
         return
+    finally:
+        if progress_task:
+            progress_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await progress_task
+        if status_message:
+            # Remove stale "processing" status on both success and failure.
+            with suppress(Exception):
+                await status_message.delete()
+        REPORT_SLOTS.release()
 
     async with _lock_for(chat_id):
         if SESSIONS.get(chat_id) is session:
+            remove_session(chat_id)
             SESSIONS.pop(chat_id, None)
         session.cleanup()
+    logger.info("Report stage=complete seconds=%.2f", time.monotonic() - started)
 
 
 async def telegram_error_handler(
@@ -339,6 +400,7 @@ async def telegram_error_handler(
             "Telegram polling conflict: another bot instance is active. "
             "Stop the other poller before restarting this workflow."
         )
+        context.application.bot_data["fatal_exit_code"] = 78
         context.application.stop_running()
         return
     logger.error(
@@ -370,13 +432,29 @@ async def _post_init(application: Application) -> None:
 
 
 async def _post_shutdown(application: Application) -> None:
-    for session in list(SESSIONS.values()):
-        session.cleanup()
+    for chat_id, session in list(SESSIONS.items()):
+        save_session(chat_id, session)
     SESSIONS.clear()
     CHAT_LOCKS.clear()
 
 
 def main() -> None:
+    # Prevent accidental local duplicate pollers; this does not lock other VMs.
+    with (state_directory() / "poller.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.error("A bot poller is already running in this environment.")
+            raise SystemExit(78)
+        try:
+            _run()
+        except Exception as error:
+            # Startup/request exceptions may contain credentials in request URLs.
+            logger.error("Bot stopped unexpectedly (%s).", type(error).__name__)
+            raise SystemExit(1) from None
+
+
+def _run() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
     missing = [
@@ -391,6 +469,8 @@ def main() -> None:
         raise SystemExit(
             "Missing required Replit Secrets: " + ", ".join(missing)
         )
+    SESSIONS.update(load_sessions())
+    logger.info("Recovered %d unfinished sessions.", len(SESSIONS))
 
     application = (
         Application.builder()
@@ -419,12 +499,14 @@ def main() -> None:
 
     logger.info("Starting EnigmaTech Inspection Bot polling.")
     application.run_polling(
-        drop_pending_updates=True,
+        drop_pending_updates=False,
         bootstrap_retries=-1,
         poll_interval=1.0,
         timeout=30,
         allowed_updates=["message"],
     )
+    if application.bot_data.get("fatal_exit_code"):
+        raise SystemExit(application.bot_data["fatal_exit_code"])
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -25,6 +26,7 @@ PREFERRED_MODEL = "gemini-3.8-flash"
 DEPRECATED_FLASH_PATTERN = re.compile(r"gemini-2\.5.*flash", re.IGNORECASE)
 MAX_FILE_PROCESSING_SECONDS = 180
 T = TypeVar("T")
+UPLOAD_WORKERS = 3
 
 REPORT_PROMPT = """פעל כמהנדס בקרת איכות ופיקוח בנייה מנוסה. נתח את הערות הטקסט,
 הקלטות השמע והתמונות המצורפות, והכן דוח פיקוח מקצועי, ברור ומבוסס ראיות בעברית.
@@ -163,7 +165,9 @@ def _uploaded_file(
     uploaded = _retry(
         lambda: client.files.upload(
             file=str(path),
-            config=types.UploadFileConfig(mime_type=mime_type),
+            config=types.UploadFileConfig(
+                mime_type=mime_type, http_options=types.HttpOptions(timeout=60_000)
+            ),
         )
     )
     name = getattr(uploaded, "name", None)
@@ -183,7 +187,11 @@ def _uploaded_file(
         if time.monotonic() >= deadline:
             raise TimeoutError("Gemini media processing took too long.")
         time.sleep(2)
-        uploaded = _retry(lambda: client.files.get(name=name))
+        uploaded = _retry(lambda: client.files.get(
+            name=name, config=types.GetFileConfig(
+                http_options=types.HttpOptions(timeout=30_000)
+            )
+        ))
 
     if not getattr(uploaded, "uri", None):
         raise RuntimeError("Gemini did not return a usable media file URI.")
@@ -194,24 +202,44 @@ def generate_inspection_report(
     notes: list[str],
     voices: list[AudioAsset],
     photos: list[PhotoAsset],
+    progress: Callable[[str], None] | None = None,
 ) -> str:
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
-    client = genai.Client(api_key=api_key)
+    # Complex reports previously needed six minutes: don't cut valid runs short.
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=600_000))
     uploaded_names: list[str] = []
     parts: list[types.Part] = [types.Part.from_text(text=REPORT_PROMPT)]
     try:
+        stage_started = time.monotonic()
+        assets = [*voices, *photos]
+        uploaded_files = [None] * len(assets)
+        if progress:
+            progress(f"מעלה ומכין קבצים: 0/{len(assets)}")
+        # Executor exit joins ALL workers before cleanup, even if one upload fails.
+        # Completion order must never change photo/recording numbering.
+        with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
+            pending = {
+                executor.submit(
+                    _uploaded_file, client, asset.path, asset.mime_type, uploaded_names
+                ): index
+                for index, asset in enumerate(assets)
+            }
+            for completed, future in enumerate(as_completed(pending), start=1):
+                uploaded_files[pending[future]] = future.result()
+                if progress:
+                    progress(f"מעלה ומכין קבצים: {completed}/{len(assets)}")
+        logger.info("Report stage=media seconds=%.2f files=%d",
+                    time.monotonic() - stage_started, len(assets))
         for index, note in enumerate(notes, start=1):
             parts.append(
                 types.Part.from_text(text=f"הערת טקסט #{index}:\n{note}")
             )
 
         for index, voice in enumerate(voices, start=1):
-            uploaded = _uploaded_file(
-                client, voice.path, voice.mime_type, uploaded_names
-            )
+            uploaded = uploaded_files[index - 1]
             parts.append(
                 types.Part.from_text(
                     text=f"הקלטה #{index}: נא לתמלל ולשלב את תוכן ההקלטה בדוח."
@@ -227,9 +255,7 @@ def generate_inspection_report(
         for index, photo in enumerate(photos, start=1):
             caption = photo.caption.strip() if photo.caption else ""
             caption_text = f"\nכיתוב: {caption}" if caption else ""
-            uploaded = _uploaded_file(
-                client, photo.path, photo.mime_type, uploaded_names
-            )
+            uploaded = uploaded_files[len(voices) + index - 1]
             parts.append(
                 types.Part.from_text(
                     text=f"תמונה #{index}{caption_text}: נתח את התמונה והשתמש "
@@ -247,6 +273,9 @@ def generate_inspection_report(
             temperature=0.2,
             max_output_tokens=8192,
         )
+        if progress:
+            progress("מנתח את החומרים וכותב את הדוח")
+        stage_started = time.monotonic()
         try:
             response = _retry(
                 lambda: client.models.generate_content(
@@ -272,15 +301,28 @@ def generate_inspection_report(
             )
 
         report_text = (response.text or "").strip()
+        logger.info("Report stage=generation seconds=%.2f",
+                    time.monotonic() - stage_started)
         if not report_text:
             raise RuntimeError("Gemini returned an empty inspection report.")
         return report_text
     finally:
-        for name in uploaded_names:
+        stage_started = time.monotonic()
+        if progress:
+            progress("מסיים עיבוד ומנקה עותקים זמניים")
+        def delete_file(name: str) -> None:
             try:
-                _retry(lambda name=name: client.files.delete(name=name), attempts=2)
+                _retry(lambda name=name: client.files.delete(
+                    name=name, config=types.DeleteFileConfig(
+                        http_options=types.HttpOptions(timeout=10_000)
+                    )
+                ), attempts=2)
             except Exception:
                 logger.warning("Could not delete a temporary Gemini media file.")
+        with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
+            list(executor.map(delete_file, uploaded_names))
+        logger.info("Report stage=remote_cleanup seconds=%.2f",
+                    time.monotonic() - stage_started)
         close = getattr(client, "close", None)
         if callable(close):
             try:

@@ -11,7 +11,9 @@ Telegram bot that turns construction-site photos, recordings, and notes into a H
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
 - Required secrets: `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`
-- Optional environment: `BOT_TIMEZONE` (defaults to `Asia/Jerusalem`), `LOG_LEVEL` (defaults to `INFO`)
+- Optional environment: `BOT_TIMEZONE` (defaults to `Asia/Jerusalem`), `LOG_LEVEL` (defaults to `INFO`), `BOT_STATE_DIR` (defaults to `.bot-state`)
+- Production: `bash scripts/build-production.sh` builds API and locked Python dependencies; `python scripts/supervise_services.py` supervises API + bot on one Reserved VM.
+- Offline preflight: `python scripts/supervise_services.py --check` checks imports without polling Telegram.
 
 ## Stack
 
@@ -31,7 +33,8 @@ Telegram bot that turns construction-site photos, recordings, and notes into a H
 
 ## Architecture decisions
 
-- Keep each chat's media session in memory, as requested; a bot restart clears unfinished sessions.
+- Journal accepted chat materials locally for process-restart recovery; local state is not durable across VM replacement or deployment. Finish old in-memory sessions before upgrading.
+- The `bot-console` web app enables publishing and provides an operating guide. Its API connectivity check must never be presented as Telegram or Gemini readiness.
 - Upload media to Gemini's Files API for multimodal processing, then delete uploaded copies after report generation.
 - Prefer `gemini-3.8-flash`; discover an available Flash model only if needed, excluding deprecated Gemini 2.5 Flash models.
 
@@ -49,6 +52,8 @@ Telegram bot that turns construction-site photos, recordings, and notes into a H
 
 - Keep the Gemini model fallback away from deprecated Gemini 2.5 Flash variants.
 - Local files are temporary and should be removed after successful delivery or `/clear`.
+- Never start a second real Telegram poller to verify builds. Use the offline preflight and mocked tests.
+- Stop the workspace poller before production cutover; keep only one VM instance. See README for safe merge/publish steps.
 
 ## Pointers
 

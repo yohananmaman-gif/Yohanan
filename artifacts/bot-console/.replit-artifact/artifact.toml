@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "EnigmaTech Bot"
+description = "Deployment landing page and operating guide for the EnigmaTech Telegram inspection bot, with live API connectivity status and accurate publishing instructions. No private reports or materials are exposed."
+version = "1.0.0"
+id = "artifacts/bot-console"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 21286
+
+[services.development]
+run = "pnpm --filter @workspace/bot-console run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/bot-console", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/bot-console/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21286"
+BASE_PATH = "/"
